@@ -1,453 +1,240 @@
 import pygame
-import math
 import random
-import sys
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
- 
+import math
+import os
+
+# --- Configuration ---
 pygame.init()
- 
-# ── Constants ──────────────────────────────────────────────────────────────────
-WIDTH, HEIGHT = 1100, 700
-WORLD_W = WIDTH * 4          # scrollable world width
-CENTER_X, CENTER_Y = WIDTH // 2, HEIGHT // 2
-FPS = 60
- 
-# Energy levels
-LOW  = 0
-MED  = 1
-HIGH = 2
- 
-# Colors
-BLACK      = (0, 0, 0)
-DEEP_BLUE  = (10, 20, 60)
-GOLD       = (255, 215, 60)
-YELLOW     = (255, 245, 100)
-TEAL       = (40, 200, 180)
-WHITE      = (255, 255, 255)
-PINK       = (255, 100, 180)
-PURPLE     = (160, 80, 255)
-SOFT_BLUE  = (80, 140, 255)
-ORANGE     = (255, 160, 40)
- 
-COPING_SYMBOLS = [
-    {"name": "Journaling",   "emoji": "📓", "color": TEAL,    "glyph": "J"},
-    {"name": "Music",        "emoji": "🎵", "color": PURPLE,  "glyph": "♪"},
-    {"name": "Breathing",    "emoji": "🌬",  "color": SOFT_BLUE, "glyph": "~"},
-    {"name": "Movement",     "emoji": "🏃", "color": ORANGE,  "glyph": "M"},
-    {"name": "Rest",         "emoji": "🌙", "color": PINK,    "glyph": "☽"},
-    {"name": "Creativity",   "emoji": "🎨", "color": GOLD,    "glyph": "✦"},
-]
- 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def lerp(a, b, t):  return a + (b - a) * t
-def clamp(v, lo, hi): return max(lo, min(hi, v))
-def dist(a, b): return math.hypot(a[0]-b[0], a[1]-b[1])
- 
-def glow_surface(radius: int, color: Tuple, alpha_center: int = 220) -> pygame.Surface:
-    s = pygame.Surface((radius*2, radius*2), pygame.SRCALPHA)
-    for r in range(radius, 0, -1):
-        a = int(alpha_center * (r / radius) ** 1.8)
-        pygame.draw.circle(s, (*color, a), (radius, radius), r)
-    return s
- 
-# ── Trail point ───────────────────────────────────────────────────────────────
-@dataclass
-class TrailPoint:
-    wx: float            # world-x
-    y:  float
-    color: Tuple
-    width: float
-    age: float = 0.0     # grows each frame; used for fade
- 
-# ── Coping symbol (world object) ──────────────────────────────────────────────
-@dataclass
-class CopingOrb:
-    wx: float
-    y: float
-    data: dict
-    collected: bool = False
-    pulse: float = 0.0
-    drift: float = 0.0   # random drift seed
- 
-# ── Main Game ─────────────────────────────────────────────────────────────────
-class LuminousSpark:
+WIDTH, HEIGHT = 1000, 700
+VIRTUAL_WORLD_SIZE = 5000 
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Cosmic Explorer - Press Space to Start")
+clock = pygame.time.Clock()
+
+PARALLAX_FACTOR = 0.3 
+font_large = pygame.font.SysFont("Arial", 48, bold=True)
+font_small = pygame.font.SysFont("Arial", 24)
+
+# --- Classes ---
+
+class SplashParticle:
+    def __init__(self, x, y, color, is_big=False, is_rock=False):
+        self.x, self.y = x, y
+        angle = random.uniform(0, math.pi * 2)
+        speed = random.uniform(4, 8) if is_rock else (random.uniform(1, 4) if is_big else random.uniform(3, 7))
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed
+        self.color = color
+        self.lifetime = 255
+        self.size = random.randint(3, 6) if is_rock else (random.randint(8, 15) if is_big else random.randint(2, 5))
+        self.is_big = is_big
+        self.is_rock = is_rock
+
+    def update(self):
+        self.x += self.vx
+        self.y += self.vy
+        self.lifetime -= 10 if self.is_rock else (4 if self.is_big else 7)
+        self.size *= 0.95
+
+    def draw(self, surface, scroll_x, scroll_y):
+        draw_x = (self.x - scroll_x) % VIRTUAL_WORLD_SIZE
+        draw_y = (self.y - scroll_y) % VIRTUAL_WORLD_SIZE
+        if draw_x > WIDTH + 100: draw_x -= VIRTUAL_WORLD_SIZE
+        if self.lifetime > 0:
+            s = pygame.Surface((int(self.size*2), int(self.size*2)), pygame.SRCALPHA)
+            pygame.draw.circle(s, (*self.color, max(0, self.lifetime)), (int(self.size), int(self.size)), int(self.size))
+            surface.blit(s, (int(draw_x - self.size), int(draw_y - self.size)))
+
+class Cloud:
     def __init__(self):
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("✦ The Luminous Spark ✦")
-        self.clock = pygame.time.Clock()
- 
-        # Fonts
-        self.font_lg  = pygame.font.SysFont("segoeuisymbol", 32, bold=True)
-        self.font_md  = pygame.font.SysFont("segoeuisymbol", 20)
-        self.font_sm  = pygame.font.SysFont("segoeuisymbol", 15)
-        self.font_xl  = pygame.font.SysFont("segoeuisymbol", 48, bold=True)
- 
-        self._init_state()
- 
-    # ── State init ─────────────────────────────────────────────────────────────
-    def _init_state(self):
-        self.energy    = MED          # 0=Low 1=Med 2=High
-        self.vibe_val  = 0.5          # 0.0–1.0 continuous
-        self.vibe_timer = 0
- 
-        # Player is always visually at (CENTER_X, CENTER_Y)
-        # World scrolls under it
-        self.cam_x = WORLD_W // 2 - CENTER_X   # camera left edge in world coords
-        self.cam_vel = 0.0
- 
-        self.player_wy = float(CENTER_Y)        # world-y of player
-        self.vel_x = 0.0
-        self.vel_y = 0.0
- 
-        self.trail: List[TrailPoint] = []
-        self.stars   = self._make_stars()
-        self.orbs    = self._make_orbs()
-        self.collected_names: List[str] = []
-        self.constellation_lines: List[Tuple] = []  # pairs of world positions
- 
-        self.spark_radius = 14
-        self.spark_glow   = 40
- 
-        self.t = 0.0          # global time
-        self.score = 0
-        self.message = ""
-        self.msg_timer = 0
- 
-        # Permanent canvas (background trail accumulates here)
-        self.canvas = pygame.Surface((WORLD_W, HEIGHT), pygame.SRCALPHA)
-        self.canvas.fill((0, 0, 0, 0))
- 
-        self.running = True
-        self.game_over = False
- 
-    # ── Stars (parallax bg) ────────────────────────────────────────────────────
-    def _make_stars(self):
-        stars = []
-        for _ in range(350):
-            stars.append({
-                "wx":   random.uniform(0, WORLD_W),
-                "y":    random.uniform(0, HEIGHT),
-                "r":    random.uniform(0.5, 2.0),
-                "bright": random.uniform(100, 255),
-                "speed":  random.uniform(0.1, 0.6),  # parallax factor
-            })
-        return stars
- 
-    # ── Orbs (coping symbols) ─────────────────────────────────────────────────
-    def _make_orbs(self):
-        orbs = []
-        positions_wx = [WORLD_W * (i+1)/(len(COPING_SYMBOLS)+1)
-                        for i in range(len(COPING_SYMBOLS))]
-        for i, sym in enumerate(COPING_SYMBOLS):
-            orbs.append(CopingOrb(
-                wx=positions_wx[i],
-                y=random.uniform(HEIGHT*0.25, HEIGHT*0.75),
-                data=sym,
-                drift=random.uniform(0, math.pi*2)
-            ))
-        return orbs
- 
-    # ── Energy / vibe ─────────────────────────────────────────────────────────
-    @property
-    def energy_color(self):
-        if self.energy == LOW:  return (30, 80, 220)
-        if self.energy == HIGH: return (255, 230, 50)
-        return (100, 220, 200)
- 
-    @property
-    def stroke_width(self):
-        if self.energy == LOW:  return random.uniform(5, 9)
-        if self.energy == HIGH: return random.uniform(1, 3)
-        return random.uniform(2.5, 5)
- 
-    @property
-    def speed_cap(self):
-        if self.energy == LOW:  return 2.5
-        if self.energy == HIGH: return 9.0
-        return 5.0
- 
-    @property
-    def accel(self):
-        if self.energy == LOW:  return 0.12
-        if self.energy == HIGH: return 0.55
-        return 0.30
- 
-    @property
-    def friction(self):
-        if self.energy == LOW:  return 0.92
-        if self.energy == HIGH: return 0.78
-        return 0.85
- 
-    # ── Player world position ─────────────────────────────────────────────────
-    @property
-    def player_wx(self): return self.cam_x + CENTER_X
- 
-    # ── Screen → world ────────────────────────────────────────────────────────
-    def world_to_screen(self, wx, wy): return wx - self.cam_x, wy
- 
-    # ── Update ────────────────────────────────────────────────────────────────
-    def update(self, keys):
-        self.t += 1 / FPS
- 
-        # ── Input ──
-        dx = dy = 0
-        if keys[pygame.K_LEFT]  or keys[pygame.K_a]: dx -= 1
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d]: dx += 1
-        if keys[pygame.K_UP]    or keys[pygame.K_w]: dy -= 1
-        if keys[pygame.K_DOWN]  or keys[pygame.K_s]: dy += 1
- 
-        # Normalise diagonal
-        if dx and dy: dx *= 0.707; dy *= 0.707
- 
-        self.vel_x += dx * self.accel * 60 / FPS
-        self.vel_y += dy * self.accel * 60 / FPS
-        self.vel_x  = clamp(self.vel_x * self.friction, -self.speed_cap, self.speed_cap)
-        self.vel_y  = clamp(self.vel_y * self.friction, -self.speed_cap, self.speed_cap)
- 
-        # ── World scroll (x axis moves world, not player) ──
-        self.cam_x += self.vel_x
-        self.cam_x  = clamp(self.cam_x, 0, WORLD_W - WIDTH)
- 
-        # ── Y moves player ──
-        self.player_wy += self.vel_y
-        self.player_wy  = clamp(self.player_wy, 20, HEIGHT - 20)
- 
-        # ── Corner return ──
-        sx = CENTER_X   # always center screen x
-        sy = self.player_wy
-        margin = 60
-        corner = (sx < margin or sx > WIDTH-margin or sy < margin or sy > HEIGHT-margin)
-        if corner:
-            # snap cam back toward center world-x, player_wy toward center
-            target_cam = WORLD_W // 2 - CENTER_X
-            self.cam_x     = lerp(self.cam_x,     target_cam, 0.15)
-            self.player_wy = lerp(self.player_wy, CENTER_Y,   0.15)
-            self.vel_x *= 0.7; self.vel_y *= 0.7
- 
-        # ── Trail ──
-        speed = math.hypot(self.vel_x, self.vel_y)
-        if speed > 0.3:
-            jag = 0
-            if self.energy == HIGH and speed > 3:
-                jag = random.uniform(-6, 6)
-            self.trail.append(TrailPoint(
-                wx=self.player_wx + random.uniform(-jag*0.3, jag*0.3),
-                y=self.player_wy + jag,
-                color=self.energy_color,
-                width=self.stroke_width,
-            ))
- 
-        # Bake old trail to canvas
-        BAKE_AFTER = 60   # frames
-        to_bake = [p for p in self.trail if p.age > BAKE_AFTER]
-        for p in to_bake:
-            c = (*p.color, 180)
-            pygame.draw.circle(self.canvas, c, (int(p.wx), int(p.y)), max(1, int(p.width//2)))
-        self.trail = [p for p in self.trail if p.age <= BAKE_AFTER]
- 
-        for p in self.trail: p.age += 1
- 
-        # ── Orb collection ──
-        for orb in self.orbs:
-            if orb.collected: continue
-            orb.pulse += 0.05
-            ox, oy = orb.wx, orb.y + math.sin(self.t*1.2 + orb.drift) * 12
-            if dist((self.player_wx, self.player_wy), (ox, oy)) < 36:
-                orb.collected = True
-                self.score += 1
-                self.message = f"✦ {orb.data['name']} collected! ✦"
-                self.msg_timer = 160
- 
-                # constellation line to previous collected orb
-                prev = [o for o in self.orbs if o.collected and o is not orb]
-                if prev:
-                    last = prev[-1]
-                    self.constellation_lines.append(
-                        ((last.wx, last.y), (orb.wx, orb.y))
-                    )
-                if self.score == len(self.orbs):
-                    self.game_over = True
- 
-        # ── Message timer ──
-        if self.msg_timer > 0: self.msg_timer -= 1
- 
-        # ── Vibe timer auto-cycle ──
-        self.vibe_timer += 1
- 
-    # ── Draw ──────────────────────────────────────────────────────────────────
-    def draw(self):
-        self.screen.fill(DEEP_BLUE)
- 
-        # ── Stars parallax ──
-        for st in self.stars:
-            sx = (st["wx"] - self.cam_x * st["speed"]) % WIDTH
-            col = int(st["bright"])
-            twinkle = int(30 * math.sin(self.t*3 + st["wx"]))
-            col = clamp(col + twinkle, 50, 255)
-            c = max(0, min(255, int(col)))
-            pygame.draw.circle(self.screen, (c, c, min(255, c+40)),
-                   (int(sx), int(st["y"])), st["r"])
- 
-        # ── Baked canvas ──
-        self.screen.blit(self.canvas, (-self.cam_x, 0))
- 
-        # ── Live trail ──
-        for p in self.trail:
-            sx, sy = self.world_to_screen(p.wx, p.y)
-            fade = 1 - (p.age / 60)
-            a = int(200 * fade)
-            c = (*p.color, a)
-            s = pygame.Surface((int(p.width*2)+4, int(p.width*2)+4), pygame.SRCALPHA)
-            pygame.draw.circle(s, c, (int(p.width)+2, int(p.width)+2), max(1,int(p.width)))
-            self.screen.blit(s, (int(sx - p.width - 2), int(sy - p.width - 2)))
- 
-        # ── Constellation lines ──
-        for (wx1,wy1),(wx2,wy2) in self.constellation_lines:
-            sx1,sy1 = self.world_to_screen(wx1,wy1)
-            sx2,sy2 = self.world_to_screen(wx2,wy2)
-            # glow line
-            for width, alpha in [(5,40),(3,80),(1,200)]:
-                s = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-                pygame.draw.line(s, (*GOLD, alpha), (int(sx1),int(sy1)), (int(sx2),int(sy2)), width)
-                self.screen.blit(s, (0,0))
- 
-        # ── Orbs ──
-        for orb in self.orbs:
-            if orb.collected: continue
-            bob = math.sin(self.t*1.2 + orb.drift) * 12
-            ox_w, oy = orb.wx, orb.y + bob
-            sx, sy = self.world_to_screen(ox_w, oy)
-            if -60 < sx < WIDTH+60:
-                pulse = 0.5 + 0.5*math.sin(orb.pulse)
-                R = int(22 + 8*pulse)
-                # outer glow
-                for r in range(R+20, R, -2):
-                    a = int(60 * (1 - (r-R)/20))
-                    gs = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
-                    pygame.draw.circle(gs, (*orb.data["color"], a), (r,r), r)
-                    self.screen.blit(gs, (int(sx-r), int(sy-r)))
-                # core
-                pygame.draw.circle(self.screen, orb.data["color"], (int(sx),int(sy)), R)
-                pygame.draw.circle(self.screen, WHITE, (int(sx),int(sy)), R, 1)
-                # glyph
-                lbl = self.font_md.render(orb.data["glyph"], True, WHITE)
-                self.screen.blit(lbl, lbl.get_rect(center=(int(sx), int(sy))))
-                # name label
-                name_lbl = self.font_sm.render(orb.data["name"], True, (*orb.data["color"], 200))
-                self.screen.blit(name_lbl, name_lbl.get_rect(center=(int(sx), int(sy)+32)))
- 
-        # ── Player Spark ──
-        px, py = CENTER_X, int(self.player_wy)
-        flicker = int(4 * math.sin(self.t*18))
-        R = self.spark_radius + flicker
-        G = self.spark_glow + abs(flicker)*2
- 
-        gsurf = glow_surface(G, self.energy_color, 160)
-        self.screen.blit(gsurf, (px-G, py-G))
- 
-        # inner layers
-        for r, a in [(R, 200), (R//2, 255)]:
-            circ = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
-            pygame.draw.circle(circ, (*self.energy_color, a), (r,r), r)
-            self.screen.blit(circ, (px-r, py-r))
- 
-        # white hot center
-        pygame.draw.circle(self.screen, WHITE, (px, py), max(3, R//3))
- 
-        # ── HUD ───────────────────────────────────────────────────────────────
-        self._draw_hud()
- 
-        # ── Message ──
-        if self.msg_timer > 0:
-            alpha = min(255, self.msg_timer * 3)
-            msg_s = self.font_lg.render(self.message, True, GOLD)
-            msg_s.set_alpha(alpha)
-            self.screen.blit(msg_s, msg_s.get_rect(center=(WIDTH//2, HEIGHT//2 - 80)))
- 
-        if self.game_over:
-            self._draw_ending()
- 
-        pygame.display.flip()
- 
-    # ── HUD ───────────────────────────────────────────────────────────────────
-    def _draw_hud(self):
-        # Energy label
-        labels = {LOW: "Low Energy  ●", MED: "Balanced  ◈", HIGH: "High Energy  ★"}
-        colors = {LOW: SOFT_BLUE, MED: TEAL, HIGH: YELLOW}
-        etxt = self.font_md.render(f"Vibe: {labels[self.energy]}", True, colors[self.energy])
-        self.screen.blit(etxt, (14, 14))
- 
-        # Score / collected
-        stxt = self.font_md.render(f"Constellations: {self.score}/{len(self.orbs)}", True, GOLD)
-        self.screen.blit(stxt, (14, 42))
- 
-        # Mini map
-        mm_w, mm_h = 160, 18
-        mm_x, mm_y = WIDTH - mm_w - 14, 14
-        pygame.draw.rect(self.screen, (20,20,50), (mm_x, mm_y, mm_w, mm_h), border_radius=4)
-        # player dot
-        frac = self.player_wx / WORLD_W
-        pdot_x = mm_x + int(frac * mm_w)
-        pygame.draw.circle(self.screen, GOLD, (pdot_x, mm_y+mm_h//2), 4)
-        # orb dots
-        for orb in self.orbs:
-            if not orb.collected:
-                fx = mm_x + int(orb.wx / WORLD_W * mm_w)
-                pygame.draw.circle(self.screen, orb.data["color"], (fx, mm_y+mm_h//2), 3)
-        pygame.draw.rect(self.screen, (*GOLD, 120), (mm_x, mm_y, mm_w, mm_h), 1, border_radius=4)
- 
-        # Controls legend (bottom)
-        ctrl = self.font_sm.render("WASD / Arrows: Move  |  1: Low Vibe  2: Balanced  3: High Vibe  |  R: Restart", True, (120,130,180))
-        self.screen.blit(ctrl, ctrl.get_rect(center=(WIDTH//2, HEIGHT-16)))
- 
-    # ── Ending ────────────────────────────────────────────────────────────────
-    def _draw_ending(self):
+        self.x = random.randint(0, VIRTUAL_WORLD_SIZE)
+        self.y = random.randint(0, VIRTUAL_WORLD_SIZE)
+        self.base_color = [220, 220, 255]
+        self.current_color = list(self.base_color)
+        self.target_color = list(self.base_color)
+        self.fluff_blobs = [{'ox': random.randint(-35, 35), 'oy': random.randint(-25, 25), 'r': random.randint(25, 45)} for _ in range(6)]
+        self.collision_radius = 60
+
+    def hit(self, particle_list):
+        new_color = [random.randint(50, 255), random.randint(50, 255), random.randint(50, 255)]
+        new_color[random.randint(0, 2)] = 255
+        self.target_color = new_color
+        for _ in range(5): particle_list.append(SplashParticle(self.x, self.y, new_color, is_big=True))
+        for _ in range(15): particle_list.append(SplashParticle(self.x, self.y, new_color, is_big=False))
+
+    def update(self):
+        for i in range(3): self.current_color[i] += (self.target_color[i] - self.current_color[i]) * 0.15
+        for i in range(3): self.target_color[i] += (self.base_color[i] - self.target_color[i]) * 0.015
+
+    def draw(self, surface, scroll_x, scroll_y):
+        draw_x = (self.x - scroll_x) % VIRTUAL_WORLD_SIZE
+        draw_y = (self.y - scroll_y) % VIRTUAL_WORLD_SIZE
+        if draw_x > WIDTH: draw_x -= VIRTUAL_WORLD_SIZE
+        if draw_y > HEIGHT: draw_y -= VIRTUAL_WORLD_SIZE
+        for b in self.fluff_blobs:
+            pos = (int(draw_x + b['ox']), int(draw_y + b['oy']))
+            s = pygame.Surface((b['r']*2, b['r']*2), pygame.SRCALPHA)
+            alpha = 100 + (100 if self.target_color != self.base_color else 0)
+            pygame.draw.circle(s, (*self.current_color, min(200, alpha)), (b['r'], b['r']), b['r'])
+            surface.blit(s, (pos[0]-b['r'], pos[1]-b['r']))
+
+class Asteroid:
+    def __init__(self):
+        self.x = random.randint(0, VIRTUAL_WORLD_SIZE)
+        self.y = random.randint(0, VIRTUAL_WORLD_SIZE)
+        self.radius = random.randint(15, 30)
+        self.color = (120, 110, 100)
+        self.active = True
+
+    def hit(self, particle_list):
+        self.active = False
+        for _ in range(12): particle_list.append(SplashParticle(self.x, self.y, (100, 100, 100), is_rock=True))
+
+    def draw(self, surface, scroll_x, scroll_y):
+        if not self.active: return
+        draw_x = (self.x - scroll_x) % VIRTUAL_WORLD_SIZE
+        draw_y = (self.y - scroll_y) % VIRTUAL_WORLD_SIZE
+        if draw_x > WIDTH: draw_x -= VIRTUAL_WORLD_SIZE
+        if draw_y > HEIGHT: draw_y -= VIRTUAL_WORLD_SIZE
+        pygame.draw.circle(surface, self.color, (int(draw_x), int(draw_y)), self.radius)
+
+class TinyPlanet:
+    def __init__(self, color):
+        self.x, self.y = WIDTH // 2, HEIGHT // 2
+        self.color, self.radius = color, 18
+        self.trail = []
+        self.trail_length = 60
+        self.hue = 0 
+
+    def update(self, target_x, target_y):
+        self.trail.append((self.x, self.y))
+        if len(self.trail) > self.trail_length: self.trail.pop(0)
+        self.x += (target_x - self.x) * 0.03
+        self.y += (target_y - self.y) * 0.03
+        self.x %= VIRTUAL_WORLD_SIZE
+        self.y %= VIRTUAL_WORLD_SIZE
+        self.hue = (self.hue + 2) % 360
+
+    def draw(self, surface, scroll_x, scroll_y):
+        for i, pos in enumerate(self.trail):
+            segment_hue = (self.hue + (i * 2)) % 360
+            color = pygame.Color(0)
+            color.hsla = (segment_hue, 100, 50, 100) 
+            alpha = int((i / self.trail_length) * 180)
+            radius = int((i / self.trail_length) * self.radius)
+            tx = (pos[0] - scroll_x) % VIRTUAL_WORLD_SIZE
+            ty = (pos[1] - scroll_y) % VIRTUAL_WORLD_SIZE
+            if tx > WIDTH: tx -= VIRTUAL_WORLD_SIZE
+            if ty > HEIGHT: ty -= VIRTUAL_WORLD_SIZE
+            if radius > 0:
+                tsurf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+                pygame.draw.circle(tsurf, (color.r, color.g, color.b, alpha), (radius, radius), radius)
+                surface.blit(tsurf, (int(tx - radius), int(ty - radius)))
+
+def load_custom_bg(filename):
+    if os.path.exists(filename):
+        try:
+            base = pygame.image.load(filename).convert()
+            w, h = base.get_size()
+            img = pygame.transform.smoothscale(base, (600, int(h * (600 / w))))
+            w, h = img.get_size()
+            mega = pygame.Surface((w*2, h*2))
+            mega.blit(img, (0,0)); mega.blit(pygame.transform.flip(img, True, False), (w,0))
+            mega.blit(pygame.transform.flip(img, False, True), (0,h)); mega.blit(pygame.transform.flip(img, True, True), (w,h))
+            return mega
+        except: pass
+    f = pygame.Surface((400, 400)); f.fill((10, 15, 35))
+    return f
+
+# --- Initialization ---
+bg_tile = load_custom_bg('111-1.png')
+t_w, t_h = bg_tile.get_size()
+player = TinyPlanet((0, 255, 255))
+asteroids = [Asteroid() for _ in range(40)]
+clouds = [Cloud() for _ in range(20)]
+splashes = []
+scroll_x, scroll_y = 0, 0
+game_state = "MENU" # State can be "MENU" or "PLAYING"
+
+def draw_text(text, font, color, y_off):
+    text_surf = font.render(text, True, color)
+    text_rect = text_surf.get_rect(center=(WIDTH // 2, HEIGHT // 2 + y_off))
+    screen.blit(text_surf, text_rect)
+
+# --- Main Loop ---
+running = True
+while running:
+    mx, my = pygame.mouse.get_pos()
+    
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE and game_state == "MENU":
+                game_state = "PLAYING"
+
+    if game_state == "PLAYING":
+        # Game Logic
+        player.update(mx + scroll_x, my + scroll_y)
+
+        def get_dist(p_x, p_y, obj_x, obj_y):
+            dx, dy = p_x - obj_x, p_y - obj_y
+            if dx > VIRTUAL_WORLD_SIZE / 2: dx -= VIRTUAL_WORLD_SIZE
+            elif dx < -VIRTUAL_WORLD_SIZE / 2: dx += VIRTUAL_WORLD_SIZE
+            if dy > VIRTUAL_WORLD_SIZE / 2: dy -= VIRTUAL_WORLD_SIZE
+            elif dy < -VIRTUAL_WORLD_SIZE / 2: dy += VIRTUAL_WORLD_SIZE
+            return math.sqrt(dx**2 + dy**2)
+
+        for c in clouds:
+            if get_dist(player.x, player.y, c.x, c.y) < c.collision_radius + player.radius:
+                if abs(c.current_color[0] - c.base_color[0]) < 5:
+                    c.hit(splashes)
+            c.update()
+
+        for a in asteroids:
+            if a.active and get_dist(player.x, player.y, a.x, a.y) < a.radius + player.radius:
+                a.hit(splashes)
+
+        for s in splashes[:]:
+            s.update()
+            if s.lifetime <= 0: splashes.remove(s)
+
+        scroll_x = player.x - WIDTH // 2
+        scroll_y = player.y - HEIGHT // 2
+
+    # --- Drawing Section ---
+    screen.fill((10, 10, 25))
+    
+    # Draw Background (Static on menu, moving in game)
+    start_x = int(-(scroll_x * PARALLAX_FACTOR) % t_w)
+    start_y = int(-(scroll_y * PARALLAX_FACTOR) % t_h)
+    for tx in range(-1, (WIDTH // t_w) + 2):
+        for ty in range(-1, (HEIGHT // t_h) + 2):
+            screen.blit(bg_tile, (tx * t_w + start_x, ty * t_h + start_y))
+
+    if game_state == "PLAYING":
+        for a in asteroids: a.draw(screen, scroll_x, scroll_y)
+        for c in clouds: c.draw(screen, scroll_x, scroll_y)
+        for s in splashes: s.draw(screen, scroll_x, scroll_y)
+        player.draw(screen, scroll_x, scroll_y)
+    
+    else:
+        # Instruction Overlay
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        overlay.fill((5, 5, 30, 190))
-        self.screen.blit(overlay, (0,0))
- 
-        title = self.font_xl.render("✦ Constellation Complete ✦", True, GOLD)
-        self.screen.blit(title, title.get_rect(center=(WIDTH//2, HEIGHT//2 - 80)))
- 
-        sub = self.font_lg.render("You mapped your journey through light.", True, TEAL)
-        self.screen.blit(sub, sub.get_rect(center=(WIDTH//2, HEIGHT//2 - 30)))
- 
-        for i, name in enumerate(self.collected_names):
-            lbl = self.font_md.render(f"✦ {name}", True, WHITE)
-            self.screen.blit(lbl, lbl.get_rect(center=(WIDTH//2, HEIGHT//2 + 20 + i*26)))
- 
-        again = self.font_md.render("Press R to start again", True, (180,180,220))
-        self.screen.blit(again, again.get_rect(center=(WIDTH//2, HEIGHT - 50)))
- 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    def run(self):
-        while self.running:
-            keys = pygame.key.get_pressed()
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_r:
-                        self._init_state()
-                    if event.key == pygame.K_1:
-                        self.energy = LOW
-                    if event.key == pygame.K_2:
-                        self.energy = MED
-                    if event.key == pygame.K_3:
-                        self.energy = HIGH
-                    if event.key == pygame.K_ESCAPE:
-                        self.running = False
- 
-            if not self.game_over:
-                self.update(keys)
-            self.draw()
-            self.clock.tick(FPS)
- 
-        pygame.quit()
-        sys.exit()
- 
- 
-if __name__ == "__main__":-0]
-    game = LuminousSpark()
-    game.run()
+        overlay.fill((0, 0, 0, 180)) # Semi-transparent black
+        screen.blit(overlay, (0,0))
+        
+        draw_text("COSMIC EXPLORER", font_large, (0, 255, 255), -100)
+        draw_text("• Move Mouse to Guide the Planet", font_small, (255, 255, 255), 0)
+        draw_text("• Bump Clouds to trigger Light Splashes", font_small, (255, 255, 255), 40)
+        draw_text("• Hit Asteroids to Shatter them", font_small, (255, 255, 255), 80)
+        
+        # Make the prompt pulse a little
+        pulse = (math.sin(pygame.time.get_ticks() * 0.005) + 1) / 2
+        prompt_color = (255 * pulse, 255 * pulse, 100 * pulse)
+        draw_text("[ PRESS SPACE TO START ]", font_small, prompt_color, 180)
+
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
